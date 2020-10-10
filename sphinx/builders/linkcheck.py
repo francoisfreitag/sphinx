@@ -77,46 +77,54 @@ def check_anchor(response: requests.requests.Response, anchor: str) -> bool:
     return parser.found
 
 
-class CheckExternalLinksBuilder(Builder):
-    """
-    Checks for broken external links.
-    """
-    name = 'linkcheck'
-    epilog = __('Look for any errors in the above output or in '
-                '%(outdir)s/output.txt')
+class LinkChecker:
+    def __init__(self, config, doc2path, rqueue):
+        self.config = config
+        self.doc2path = doc2path
+        self.rqueue = rqueue
 
-    def init(self) -> None:
-        self.to_ignore = [re.compile(x) for x in self.app.config.linkcheck_ignore]
+        self.to_ignore = [re.compile(x) for x in config.linkcheck_ignore]
         self.anchors_ignore = [re.compile(x)
-                               for x in self.app.config.linkcheck_anchors_ignore]
+                               for x in config.linkcheck_anchors_ignore]
         self.auth = [(re.compile(pattern), auth_info) for pattern, auth_info
-                     in self.app.config.linkcheck_auth]
+                     in config.linkcheck_auth]
+
         self.good = set()       # type: Set[str]
         self.broken = {}        # type: Dict[str, str]
         self.redirected = {}    # type: Dict[str, Tuple[str, int]]
+
         # set a timeout for non-responding servers
         socket.setdefaulttimeout(5.0)
-        # create output file
-        open(path.join(self.outdir, 'output.txt'), 'w').close()
-        # create JSON output file
-        open(path.join(self.outdir, 'output.json'), 'w').close()
 
-        # create queues and worker threads
-        self.wqueue = queue.Queue()  # type: queue.Queue
-        self.rqueue = queue.Queue()  # type: queue.Queue
+        self.wqueue = queue.Queue()
         self.workers = []  # type: List[threading.Thread]
-        for i in range(self.app.config.linkcheck_workers):
+        for i in range(config.linkcheck_workers):
             thread = threading.Thread(target=self.check_thread)
             thread.setDaemon(True)
             thread.start()
             self.workers.append(thread)
 
+    def add_link(self, uri, docname, lineno):
+        self.wqueue.put((uri, docname, lineno), False)
+
+    def queuing_complete(self):
+        for _ in self.workers:
+            self.wqueue.put((None, None, None), False)
+
+    def is_done(self):
+        return self.wqueue.empty()
+
+    def join(self) -> bool:
+        for worker in self.workers:
+            worker.join()
+        return bool(self.broken)
+
     def check_thread(self) -> None:
         kwargs = {
             'allow_redirects': True,
         }  # type: Dict
-        if self.app.config.linkcheck_timeout:
-            kwargs['timeout'] = self.app.config.linkcheck_timeout
+        if self.config.linkcheck_timeout:
+            kwargs['timeout'] = self.config.linkcheck_timeout
 
         def get_request_headers() -> Dict:
             url = urlparse(uri)
@@ -162,9 +170,9 @@ class CheckExternalLinksBuilder(Builder):
             kwargs['headers'] = get_request_headers()
 
             try:
-                if anchor and self.app.config.linkcheck_anchors:
+                if anchor and self.config.linkcheck_anchors:
                     # Read the whole document and see if #anchor exists
-                    response = requests.get(req_url, stream=True, config=self.app.config,
+                    response = requests.get(req_url, stream=True, config=self.config,
                                             auth=auth_info, **kwargs)
                     response.raise_for_status()
                     found = check_anchor(response, unquote(anchor))
@@ -175,13 +183,13 @@ class CheckExternalLinksBuilder(Builder):
                     try:
                         # try a HEAD request first, which should be easier on
                         # the server and the network
-                        response = requests.head(req_url, config=self.app.config,
+                        response = requests.head(req_url, config=self.config,
                                                  auth=auth_info, **kwargs)
                         response.raise_for_status()
                     except HTTPError:
                         # retry with GET request if that fails, some servers
                         # don't like HEAD requests.
-                        response = requests.get(req_url, stream=True, config=self.app.config,
+                        response = requests.get(req_url, stream=True, config=self.config,
                                                 auth=auth_info, **kwargs)
                         response.raise_for_status()
             except HTTPError as err:
@@ -220,7 +228,7 @@ class CheckExternalLinksBuilder(Builder):
                     # non supported URI schemes (ex. ftp)
                     return 'unchecked', '', 0
                 else:
-                    srcdir = path.dirname(self.env.doc2path(docname))
+                    srcdir = path.dirname(self.doc2path(docname))
                     if path.exists(path.join(srcdir, uri)):
                         return 'working', '', 0
                     else:
@@ -240,7 +248,7 @@ class CheckExternalLinksBuilder(Builder):
                     return 'ignored', '', 0
 
             # need to actually check the URI
-            for _ in range(self.app.config.linkcheck_retries):
+            for _ in range(self.config.linkcheck_retries):
                 status, info, code = check_uri()
                 if status != "broken":
                     break
@@ -261,6 +269,25 @@ class CheckExternalLinksBuilder(Builder):
             status, info, code = check(docname)
             self.rqueue.put((uri, docname, lineno, status, info, code))
 
+
+class CheckExternalLinksBuilder(Builder):
+    """
+    Checks for broken external links.
+    """
+    name = 'linkcheck'
+    epilog = __('Look for any errors in the above output or in '
+                '%(outdir)s/output.txt')
+
+    def init(self) -> None:
+        # create output file
+        open(path.join(self.outdir, 'output.txt'), 'w').close()
+        # create JSON output file
+        open(path.join(self.outdir, 'output.json'), 'w').close()
+
+        self.rqueue = queue.Queue()  # type: queue.Queue
+
+        self.checker = LinkChecker(self.app.config, self.env.doc2path, self.rqueue)
+
     def process_result(self, result: Tuple[str, str, int, str, str, int]) -> None:
         uri, docname, lineno, status, info, code = result
 
@@ -270,10 +297,8 @@ class CheckExternalLinksBuilder(Builder):
                         info=info)
         if status == 'unchecked':
             self.write_linkstat(linkstat)
-            return
         if status == 'working' and info == 'old':
             self.write_linkstat(linkstat)
-            return
         if lineno:
             logger.info('(line %4d) ', lineno, nonl=True)
         if status == 'ignored':
@@ -325,7 +350,6 @@ class CheckExternalLinksBuilder(Builder):
 
     def write_doc(self, docname: str, doctree: Node) -> None:
         logger.info('')
-        n = 0
 
         # reference nodes
         for refnode in doctree.traverse(nodes.reference):
@@ -333,24 +357,14 @@ class CheckExternalLinksBuilder(Builder):
                 continue
             uri = refnode['refuri']
             lineno = get_node_line(refnode)
-            self.wqueue.put((uri, docname, lineno), False)
-            n += 1
+            self.checker.add_link(uri, docname, lineno)
 
         # image nodes
         for imgnode in doctree.traverse(nodes.image):
             uri = imgnode['candidates'].get('?')
             if uri and '://' in uri:
                 lineno = get_node_line(imgnode)
-                self.wqueue.put((uri, docname, lineno), False)
-                n += 1
-
-        done = 0
-        while done < n:
-            self.process_result(self.rqueue.get())
-            done += 1
-
-        if self.broken:
-            self.app.statuscode = 1
+                self.checker.add_link(uri, docname, lineno)
 
     def write_entry(self, what: str, docname: str, filename: str, line: int,
                     uri: str) -> None:
@@ -363,8 +377,12 @@ class CheckExternalLinksBuilder(Builder):
             output.write('\n')
 
     def finish(self) -> None:
-        for worker in self.workers:
-            self.wqueue.put((None, None, None), False)
+        self.checker.queuing_complete()
+        while not self.checker.is_done() or not self.rqueue.empty():
+            self.process_result(self.rqueue.get())
+        broken = self.checker.join()
+        if broken:
+            self.app.statuscode = 1
 
 
 def setup(app: Sphinx) -> Dict[str, Any]:
